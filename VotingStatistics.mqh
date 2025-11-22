@@ -1508,14 +1508,23 @@ private:
     void CheckAndLearnLesson(int indicatorId) {
         if(indicatorId < 0 || indicatorId >= 8) return;
 
+        // Array estático para rastrear la última lección aprendida por cada indicador
+        static int lastLessonNumber[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
         // Obtener total de trades del indicador
         int totalTrades = m_specializations[indicatorId].globalMetrics.buyTrades +
                          m_specializations[indicatorId].globalMetrics.sellTrades;
 
-        // Aprender cada 10 trades
-        if(totalTrades > 0 && (totalTrades % 10) == 0) {
-            Print("📚 LECCIÓN #", totalTrades / 10, " - Analizando indicador: ",
-                  m_specializations[indicatorId].indicatorName);
+        // Calcular número de lección actual (cada 10 trades)
+        int currentLessonNumber = totalTrades / 10;
+
+        // Aprender solo si hay suficientes trades Y la lección es nueva
+        if(totalTrades >= 10 && currentLessonNumber > lastLessonNumber[indicatorId]) {
+            lastLessonNumber[indicatorId] = currentLessonNumber;
+
+            Print("📚 LECCIÓN #", currentLessonNumber, " - Analizando indicador: ",
+                  m_specializations[indicatorId].indicatorName,
+                  " (", totalTrades, " trades totales)");
 
             AnalyzeAndAdapt(indicatorId);
         }
