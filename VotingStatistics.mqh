@@ -828,17 +828,17 @@ public:
     //+------------------------------------------------------------------+
     //| Actualizar performance después de trade                         |
     //+------------------------------------------------------------------+
-    void UpdatePerformance(int indicatorId, EnhancedMarketContext &context, 
-                          ENUM_VOTE_DIRECTION vote, bool won, double profit, 
+    void UpdatePerformance(int indicatorId, EnhancedMarketContext &context,
+                          ENUM_VOTE_DIRECTION vote, bool won, double profit,
                           int bars, double mae, double mfe) {
         // Validar entrada
         if(indicatorId < 0 || indicatorId >= 8) return;
-        
+
         // Obtener índices de contexto
         int ses = MathMin(4, (int)context.session);
         int vol = MathMin(4, (int)context.volatility);
         int dir = MathMin(4, (int)context.direction + 2); // Ajustar por valores negativos
-        
+
         // Actualizar celda de performance (acceso directo sin puntero)
         m_performanceMatrix[indicatorId][ses][vol][dir].metrics.UpdateMetrics(vote, won, profit, bars, mae, mfe);
         m_performanceMatrix[indicatorId][ses][vol][dir].sampleSize++;
@@ -863,22 +863,31 @@ public:
         m_specializations[indicatorId].globalMetrics.UpdateMetrics(vote, won, profit, bars, mae, mfe);
         m_specializations[indicatorId].UpdateMarketTypeScores(context.regime, won ? 1.0 : 0.0);
         m_specializations[indicatorId].UpdateTrustScore();
-        
+
+        // NUEVO: Actualizar peso dinámico basado en performance
+        UpdateDynamicWeight(indicatorId);
+
+        // NUEVO: Actualizar multiplicador de confianza por dirección
+        UpdateConfidenceMultiplier(indicatorId, vote, won);
+
         // Registrar error si fue pérdida significativa
         if(!won && MathAbs(profit) > context.atr * 2) {
             RegisterErrorPattern(indicatorId, context, vote, MathAbs(profit));
         } else if(won) {
             ClearErrorPattern(indicatorId, context);
         }
-        
+
         // Actualizar estadísticas globales
         m_totalSystemTrades++;
         m_totalSystemProfit += profit;
         m_systemWinRate = ((m_systemWinRate * (m_totalSystemTrades - 1)) + (won ? 1.0 : 0.0)) / m_totalSystemTrades;
-        
+
         // Guardar decisión en historial
         AddToDecisionHistory(context, vote, profit, won);
-        
+
+        // NUEVO: Verificar si es momento de aprender (cada 10 trades del indicador)
+        CheckAndLearnLesson(indicatorId);
+
         // Optimización periódica
         if(TimeCurrent() - m_lastOptimizationTime > 86400) { // Cada 24 horas
             OptimizeSystem();
@@ -1047,24 +1056,22 @@ private:
     //| Calcular peso base del indicador                                |
     //+------------------------------------------------------------------+
     double CalculateBaseWeight(int indicatorId) {
-        // Peso base según performance general (acceso directo sin puntero)
-        double avgWinRate = (m_specializations[indicatorId].globalMetrics.buyWinRate +
-                            m_specializations[indicatorId].globalMetrics.sellWinRate) / 2;
-        double avgPF = (m_specializations[indicatorId].globalMetrics.buyProfitFactor +
-                       m_specializations[indicatorId].globalMetrics.sellProfitFactor) / 2;
+        // Usar adaptationRate actualizado dinámicamente (rango 0.5 - 2.0)
+        // Este se actualiza en UpdateDynamicWeight() basado en WinRate, ProfitFactor y Momentum
+        double dynamicWeight = m_specializations[indicatorId].adaptationRate;
 
-        double weight = 0.1; // Peso mínimo
-
-        if(avgWinRate > 0.5) weight += (avgWinRate - 0.5) * 0.4;
-        if(avgPF > 1.0) weight += MathMin(0.3, (avgPF - 1.0) * 0.15);
-
-        // Bonus por experiencia
+        // Bonus por experiencia (hasta +0.2)
         int totalTrades = m_specializations[indicatorId].globalMetrics.buyTrades +
                          m_specializations[indicatorId].globalMetrics.sellTrades;
-        if(totalTrades > 100) weight += 0.1;
-        if(totalTrades > 500) weight += 0.1;
-        
-        return MathMin(0.4, weight); // Máximo 40% de peso base
+        double experienceBonus = 0.0;
+        if(totalTrades > 100) experienceBonus += 0.1;
+        if(totalTrades > 500) experienceBonus += 0.1;
+
+        // Peso final = adaptationRate + bonus experiencia
+        double finalWeight = dynamicWeight + experienceBonus;
+
+        // Limitar al rango 0.5 - 2.5
+        return MathMax(0.5, MathMin(2.5, finalWeight));
     }
     
     //+------------------------------------------------------------------+
@@ -1099,13 +1106,23 @@ private:
     //| Calcular bonus por performance reciente                         |
     //+------------------------------------------------------------------+
     double CalculatePerformanceBonus(int indicatorId) {
+        // Usar confianza ajustada (rango 0.1 - 1.0)
+        double confidence = m_specializations[indicatorId].globalMetrics.confidenceScore;
+
         // Bonus por momentum positivo (acceso directo sin puntero)
+        double momentumBonus = 0.0;
         if(m_specializations[indicatorId].globalMetrics.performanceMomentum > 0) {
-            return m_specializations[indicatorId].globalMetrics.performanceMomentum * 0.2;
+            momentumBonus = m_specializations[indicatorId].globalMetrics.performanceMomentum * 0.2;
+        } else {
+            // Penalización por momentum negativo (más suave)
+            momentumBonus = m_specializations[indicatorId].globalMetrics.performanceMomentum * 0.1;
         }
 
-        // Penalización por momentum negativo
-        return m_specializations[indicatorId].globalMetrics.performanceMomentum * 0.1;
+        // Bonus combinado: confianza + momentum
+        // Rango total: -0.2 a +0.5
+        double totalBonus = ((confidence - 0.5) * 0.4) + momentumBonus;
+
+        return MathMax(-0.3, MathMin(0.5, totalBonus));
     }
     
     //+------------------------------------------------------------------+
@@ -1412,6 +1429,291 @@ private:
     void UpdateIndicatorCorrelations() {
         // Este método se llamaría después de cada votación
         // para actualizar las correlaciones basadas en los votos
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Actualizar peso dinámico del indicador                   |
+    //+------------------------------------------------------------------+
+    void UpdateDynamicWeight(int indicatorId) {
+        if(indicatorId < 0 || indicatorId >= 8) return;
+
+        // Calcular nuevo peso base según WinRate y ProfitFactor
+        double avgWinRate = (m_specializations[indicatorId].globalMetrics.buyWinRate +
+                            m_specializations[indicatorId].globalMetrics.sellWinRate) / 2;
+        double avgPF = (m_specializations[indicatorId].globalMetrics.buyProfitFactor +
+                       m_specializations[indicatorId].globalMetrics.sellProfitFactor) / 2;
+        double momentum = m_specializations[indicatorId].globalMetrics.performanceMomentum;
+
+        // Peso dinámico: 0.5 - 2.0
+        double newWeight = 1.0; // Base
+
+        // Ajuste por WinRate (±0.4)
+        if(avgWinRate > 0.5) {
+            newWeight += (avgWinRate - 0.5) * 0.8; // Bonus hasta +0.4
+        } else {
+            newWeight -= (0.5 - avgWinRate) * 0.8; // Penalización hasta -0.4
+        }
+
+        // Ajuste por ProfitFactor (±0.3)
+        if(avgPF > 1.0) {
+            newWeight += MathMin(0.3, (avgPF - 1.0) * 0.15);
+        } else {
+            newWeight -= MathMin(0.3, (1.0 - avgPF) * 0.15);
+        }
+
+        // Ajuste por momentum (±0.2)
+        newWeight += momentum * 0.2;
+
+        // Limitar rango 0.5 - 2.0
+        newWeight = MathMax(0.5, MathMin(2.0, newWeight));
+
+        // Actualizar (aplicar suavizado)
+        m_specializations[indicatorId].adaptationRate =
+            (m_specializations[indicatorId].adaptationRate * 0.8) + (newWeight * 0.2);
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Actualizar multiplicador de confianza por dirección      |
+    //+------------------------------------------------------------------+
+    void UpdateConfidenceMultiplier(int indicatorId, ENUM_VOTE_DIRECTION vote, bool won) {
+        if(indicatorId < 0 || indicatorId >= 8) return;
+
+        // Incremento/decremento basado en resultado
+        double delta = won ? 0.10 : -0.08; // +10% si gana, -8% si pierde
+
+        // Aplicar a la métrica de dirección correspondiente
+        if(vote == VOTE_BUY || vote == VOTE_STRONG_BUY) {
+            // Ajustar confianza en BUY
+            double currentConf = m_specializations[indicatorId].globalMetrics.buyWinRate;
+            double newConf = MathMax(0.3, MathMin(2.5, currentConf * (1.0 + delta)));
+
+            // Actualizar con suavizado
+            m_specializations[indicatorId].globalMetrics.confidenceScore =
+                (m_specializations[indicatorId].globalMetrics.confidenceScore * 0.9) + (newConf * 0.1);
+
+        } else if(vote == VOTE_SELL || vote == VOTE_STRONG_SELL) {
+            // Ajustar confianza en SELL
+            double currentConf = m_specializations[indicatorId].globalMetrics.sellWinRate;
+            double newConf = MathMax(0.3, MathMin(2.5, currentConf * (1.0 + delta)));
+
+            // Actualizar con suavizado
+            m_specializations[indicatorId].globalMetrics.confidenceScore =
+                (m_specializations[indicatorId].globalMetrics.confidenceScore * 0.9) + (newConf * 0.1);
+        }
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Verificar y aprender cada 10 trades                      |
+    //+------------------------------------------------------------------+
+    void CheckAndLearnLesson(int indicatorId) {
+        if(indicatorId < 0 || indicatorId >= 8) return;
+
+        // Obtener total de trades del indicador
+        int totalTrades = m_specializations[indicatorId].globalMetrics.buyTrades +
+                         m_specializations[indicatorId].globalMetrics.sellTrades;
+
+        // Aprender cada 10 trades
+        if(totalTrades > 0 && (totalTrades % 10) == 0) {
+            Print("📚 LECCIÓN #", totalTrades / 10, " - Analizando indicador: ",
+                  m_specializations[indicatorId].indicatorName);
+
+            AnalyzeAndAdapt(indicatorId);
+        }
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Analizar y adaptar basado en aprendizaje                 |
+    //+------------------------------------------------------------------+
+    void AnalyzeAndAdapt(int indicatorId) {
+        if(indicatorId < 0 || indicatorId >= 8) return;
+
+        string indicatorName = m_specializations[indicatorId].indicatorName;
+        int totalTrades = m_specializations[indicatorId].globalMetrics.buyTrades +
+                         m_specializations[indicatorId].globalMetrics.sellTrades;
+
+        Print("┌─────────────────────────────────────────────────────────────");
+        Print("│ 🎓 ANÁLISIS Y ADAPTACIÓN - ", indicatorName);
+        Print("│ Total Trades: ", totalTrades);
+        Print("├─────────────────────────────────────────────────────────────");
+
+        // 1. Analizar mejor sesión
+        ENUM_TRADING_SESSION bestSession = SESSION_ASIA;
+        double bestSessionWR = 0.0;
+
+        for(int ses = 0; ses < 5; ses++) {
+            double sessionWR = CalculateSessionWinRate(indicatorId, (ENUM_TRADING_SESSION)ses);
+            if(sessionWR > bestSessionWR) {
+                bestSessionWR = sessionWR;
+                bestSession = (ENUM_TRADING_SESSION)ses;
+            }
+        }
+
+        Print("│ ✅ Mejor Sesión: ", GetSessionName(bestSession),
+              " (WR: ", DoubleToString(bestSessionWR * 100, 1), "%)");
+
+        // 2. Analizar mejor volatilidad
+        ENUM_VOLATILITY_LEVEL bestVol = VOL_MEDIUM;
+        double bestVolWR = 0.0;
+
+        for(int vol = 0; vol < 5; vol++) {
+            double volWR = CalculateVolatilityWinRate(indicatorId, (ENUM_VOLATILITY_LEVEL)vol);
+            if(volWR > bestVolWR) {
+                bestVolWR = volWR;
+                bestVol = (ENUM_VOLATILITY_LEVEL)vol;
+            }
+        }
+
+        Print("│ ✅ Mejor Volatilidad: ", GetVolatilityName(bestVol),
+              " (WR: ", DoubleToString(bestVolWR * 100, 1), "%)");
+
+        // 3. Analizar especialización direccional
+        double buyWR = m_specializations[indicatorId].globalMetrics.buyWinRate;
+        double sellWR = m_specializations[indicatorId].globalMetrics.sellWinRate;
+
+        string specialization = "Balanceado";
+        if(buyWR > sellWR + 0.1) {
+            specialization = "BUY";
+        } else if(sellWR > buyWR + 0.1) {
+            specialization = "SELL";
+        }
+
+        Print("│ ✅ Especialización: ", specialization,
+              " (BUY: ", DoubleToString(buyWR * 100, 1), "% | SELL: ",
+              DoubleToString(sellWR * 100, 1), "%)");
+
+        // 4. Actualizar nivel de expertise
+        m_performanceMatrix[indicatorId][0][0][0].UpdateExpertiseLevel();
+        ENUM_EXPERTISE_LEVEL expertise = m_performanceMatrix[indicatorId][0][0][0].expertiseLevel;
+
+        Print("│ 🏆 Nivel de Expertise: ", GetExpertiseName(expertise));
+
+        // 5. Generar insight completo
+        string insight = GenerateInsight(indicatorName, totalTrades, bestSession, bestSessionWR,
+                                        bestVol, bestVolWR, specialization, buyWR, sellWR);
+
+        Print("│");
+        Print("│ 💡 INSIGHT:");
+        Print("│ ", insight);
+        Print("└─────────────────────────────────────────────────────────────");
+
+        // 6. Adaptar pesos si es necesario
+        AdaptWeightsForContext(indicatorId, bestSession, bestVol);
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Generar insight de aprendizaje                           |
+    //+------------------------------------------------------------------+
+    string GenerateInsight(string name, int trades, ENUM_TRADING_SESSION bestSession,
+                          double sessionWR, ENUM_VOLATILITY_LEVEL bestVol, double volWR,
+                          string specialization, double buyWR, double sellWR) {
+        string insight = name + " (" + IntegerToString(trades) + " trades): ";
+
+        // Insight sobre sesión
+        if(sessionWR > 0.65) {
+            insight += "Excelente en " + GetSessionName(bestSession) + " (" +
+                      DoubleToString(sessionWR * 100, 0) + "%). ";
+        } else if(sessionWR > 0.55) {
+            insight += "Mejor en " + GetSessionName(bestSession) + " (" +
+                      DoubleToString(sessionWR * 100, 0) + "%). ";
+        }
+
+        // Insight sobre volatilidad
+        if(volWR > 0.65) {
+            insight += "Domina en volatilidad " + GetVolatilityName(bestVol) + ". ";
+        }
+
+        // Insight sobre dirección
+        if(specialization != "Balanceado") {
+            insight += "Especializado en " + specialization + ". ";
+        }
+
+        // Recomendación
+        if(sessionWR > 0.70 || volWR > 0.70) {
+            insight += "¡Seguir explotando estas condiciones!";
+        } else if(sessionWR < 0.45 && volWR < 0.45) {
+            insight += "Necesita más datos para mejorar.";
+        }
+
+        return insight;
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Adaptar pesos para contextos favorables                  |
+    //+------------------------------------------------------------------+
+    void AdaptWeightsForContext(int indicatorId, ENUM_TRADING_SESSION bestSession,
+                               ENUM_VOLATILITY_LEVEL bestVol) {
+        // Aumentar peso para contextos favorables
+        for(int ses = 0; ses < 5; ses++) {
+            for(int vol = 0; vol < 5; vol++) {
+                for(int dir = 0; dir < 5; dir++) {
+                    // Si es el mejor contexto, aumentar peso
+                    if(ses == (int)bestSession && vol == (int)bestVol) {
+                        // Aumentar peso base en 10%
+                        double currentWeight = m_specializations[indicatorId].adaptationRate;
+                        m_specializations[indicatorId].adaptationRate =
+                            MathMin(2.0, currentWeight * 1.1);
+                    }
+                }
+            }
+        }
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Calcular WinRate por sesión                              |
+    //+------------------------------------------------------------------+
+    double CalculateSessionWinRate(int indicatorId, ENUM_TRADING_SESSION session) {
+        int totalWins = 0;
+        int totalTrades = 0;
+
+        int ses = (int)session;
+
+        for(int vol = 0; vol < 5; vol++) {
+            for(int dir = 0; dir < 5; dir++) {
+                totalWins += (m_performanceMatrix[indicatorId][ses][vol][dir].metrics.buyWins +
+                             m_performanceMatrix[indicatorId][ses][vol][dir].metrics.sellWins);
+                totalTrades += (m_performanceMatrix[indicatorId][ses][vol][dir].metrics.buyTrades +
+                               m_performanceMatrix[indicatorId][ses][vol][dir].metrics.sellTrades);
+            }
+        }
+
+        return (totalTrades > 0) ? (double)totalWins / totalTrades : 0.5;
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Calcular WinRate por volatilidad                         |
+    //+------------------------------------------------------------------+
+    double CalculateVolatilityWinRate(int indicatorId, ENUM_VOLATILITY_LEVEL volatility) {
+        int totalWins = 0;
+        int totalTrades = 0;
+
+        int vol = (int)volatility;
+
+        for(int ses = 0; ses < 5; ses++) {
+            for(int dir = 0; dir < 5; dir++) {
+                totalWins += (m_performanceMatrix[indicatorId][ses][vol][dir].metrics.buyWins +
+                             m_performanceMatrix[indicatorId][ses][vol][dir].metrics.sellWins);
+                totalTrades += (m_performanceMatrix[indicatorId][ses][vol][dir].metrics.buyTrades +
+                               m_performanceMatrix[indicatorId][ses][vol][dir].metrics.sellTrades);
+            }
+        }
+
+        return (totalTrades > 0) ? (double)totalWins / totalTrades : 0.5;
+    }
+
+    //+------------------------------------------------------------------+
+    //| NUEVO: Obtener nombre de nivel de expertise                     |
+    //+------------------------------------------------------------------+
+    string GetExpertiseName(ENUM_EXPERTISE_LEVEL level) {
+        switch(level) {
+            case EXPERTISE_GRANDMASTER: return "GrandMaster";
+            case EXPERTISE_MASTER: return "Master";
+            case EXPERTISE_EXPERT: return "Expert";
+            case EXPERTISE_PROFICIENT: return "Proficient";
+            case EXPERTISE_COMPETENT: return "Competent";
+            case EXPERTISE_NOVICE: return "Novice";
+            case EXPERTISE_LEARNING: return "Learning";
+            default: return "None";
+        }
     }
     
     //+------------------------------------------------------------------+
