@@ -1581,9 +1581,33 @@ private:
               " (BUY: ", DoubleToString(buyWR * 100, 1), "% | SELL: ",
               DoubleToString(sellWR * 100, 1), "%)");
 
-        // 4. Actualizar nivel de expertise
-        m_performanceMatrix[indicatorId][0][0][0].UpdateExpertiseLevel();
-        ENUM_EXPERTISE_LEVEL expertise = m_performanceMatrix[indicatorId][0][0][0].expertiseLevel;
+        // 4. Calcular nivel de expertise basado en métricas globales
+        ENUM_EXPERTISE_LEVEL expertise = EXPERTISE_NONE;
+        double avgWinRate = (buyWR + sellWR) / 2;
+        double avgPF = (m_specializations[indicatorId].globalMetrics.buyProfitFactor +
+                       m_specializations[indicatorId].globalMetrics.sellProfitFactor) / 2;
+
+        // Determinar expertise basado en trades y performance
+        if(totalTrades < 20) {
+            expertise = EXPERTISE_LEARNING;
+        } else if(totalTrades < 50) {
+            expertise = (avgWinRate > 0.52) ? EXPERTISE_NOVICE : EXPERTISE_LEARNING;
+        } else if(totalTrades < 100) {
+            if(avgWinRate > 0.58 && avgPF > 1.3) expertise = EXPERTISE_COMPETENT;
+            else expertise = EXPERTISE_NOVICE;
+        } else if(totalTrades < 200) {
+            if(avgWinRate > 0.62 && avgPF > 1.5) expertise = EXPERTISE_PROFICIENT;
+            else expertise = EXPERTISE_COMPETENT;
+        } else if(totalTrades < 500) {
+            if(avgWinRate > 0.65 && avgPF > 1.8) expertise = EXPERTISE_EXPERT;
+            else expertise = EXPERTISE_PROFICIENT;
+        } else if(totalTrades < 1000) {
+            if(avgWinRate > 0.68 && avgPF > 2.0) expertise = EXPERTISE_MASTER;
+            else expertise = EXPERTISE_EXPERT;
+        } else {
+            if(avgWinRate > 0.72 && avgPF > 2.5) expertise = EXPERTISE_GRANDMASTER;
+            else expertise = EXPERTISE_MASTER;
+        }
 
         Print("│ 🏆 Nivel de Expertise: ", GetExpertiseName(expertise));
 
@@ -1642,19 +1666,19 @@ private:
     //+------------------------------------------------------------------+
     void AdaptWeightsForContext(int indicatorId, ENUM_TRADING_SESSION bestSession,
                                ENUM_VOLATILITY_LEVEL bestVol) {
-        // Aumentar peso para contextos favorables
-        for(int ses = 0; ses < 5; ses++) {
-            for(int vol = 0; vol < 5; vol++) {
-                for(int dir = 0; dir < 5; dir++) {
-                    // Si es el mejor contexto, aumentar peso
-                    if(ses == (int)bestSession && vol == (int)bestVol) {
-                        // Aumentar peso base en 10%
-                        double currentWeight = m_specializations[indicatorId].adaptationRate;
-                        m_specializations[indicatorId].adaptationRate =
-                            MathMin(2.0, currentWeight * 1.1);
-                    }
-                }
-            }
+        if(indicatorId < 0 || indicatorId >= 8) return;
+
+        // Aumentar peso base del indicador en 5% cuando identifica su mejor contexto
+        // Esto ayuda a que el indicador tenga más influencia en sus condiciones óptimas
+        double currentWeight = m_specializations[indicatorId].adaptationRate;
+        double newWeight = MathMin(2.0, currentWeight * 1.05);
+
+        // Solo actualizar si el nuevo peso es mejor
+        if(newWeight > currentWeight) {
+            m_specializations[indicatorId].adaptationRate = newWeight;
+
+            Print("│ ⚙️ Peso adaptado: ", m_specializations[indicatorId].indicatorName,
+                  " de ", DoubleToString(currentWeight, 3), " a ", DoubleToString(newWeight, 3));
         }
     }
 
